@@ -80,7 +80,7 @@ def test_aliases_drops_auto_short_id():
 
 class _Img:
     def __init__(self, repo_digests):
-        self.attrs = {"RepoDigests": repo_digests}
+        self.attrs = {"RepoDigests": repo_digests, "Config": {}}
 
 
 class _FakeContainer:
@@ -88,6 +88,7 @@ class _FakeContainer:
         self.name = name
         self.id = cid
         self.attrs = attrs if attrs is not None else {"Config": {"Image": "app:1.0.0"}}
+        self.attrs.setdefault("Name", "/" + name)
         self.status = status
         self.image = _Img(repo_digests or [])
         self.events = []
@@ -102,7 +103,7 @@ class _FakeContainer:
         self.events.append("start"); self.status = "running"
 
     def rename(self, new):
-        self.events.append(f"rename:{new}"); self.name = new
+        self.events.append(f"rename:{new}"); self.name = new; self.attrs["Name"] = "/" + new
 
     def remove(self, force=False):
         self.events.append("remove")
@@ -137,6 +138,9 @@ class _FakeAPI:
         self.connected.append((net, opts))
 
     def start(self, cid):
+        pass
+
+    def remove_container(self, cid, force=False):
         pass
 
 
@@ -201,13 +205,17 @@ def test_safe_update_rolls_back_unhealthy(tmp_path, monkeypatch):
 
 
 def test_safe_update_create_failure_restores_original(tmp_path, monkeypatch):
-    """THE regression test: if creating the replacement fails, the original must come back."""
+    """THE regression test: if creating the replacement fails, the original must come back.
+
+    A failed create/start is a clean rollback (we restored you), not an 'error' — 'error' is
+    reserved for a failure to restore the original.
+    """
     monkeypatch.setattr(core, "HISTORY_PATH", tmp_path / "h.json")
     old = _FakeContainer("db", attrs={"Config": {"Image": "pg:15"}, "HostConfig": {}})
     new = _FakeContainer("db", cid="newid")
     client = _FakeClient(new, fail_create=True)
     result = core.safe_update(client, old, "pg:16", _policy())
-    assert result == "error"
+    assert result == "rolled_back"
     assert old.name == "db"            # restored to its real name
     assert "remove" not in old.events  # NEVER destroyed
     assert old.events.count("start") >= 1
@@ -220,6 +228,34 @@ def test_safe_update_pull_failure_is_noop(tmp_path, monkeypatch):
     result = core.safe_update(client, old, "app:1.1.0", _policy())
     assert result == "error"
     assert old.events == []            # original wasn't touched at all
+
+
+def test_recreate_omits_image_default_cmd_entrypoint():
+    """Regression: don't force the OLD image's baked-in cmd/entrypoint onto the new image.
+    (This broke the alpine rollback demo: it tried to exec /whoami inside alpine.)"""
+    attrs = {
+        "Config": {"Image": "app:1.0.0", "Cmd": ["/whoami"], "Entrypoint": ["/whoami"]},
+        "HostConfig": {"NetworkMode": "default"}, "NetworkSettings": {"Networks": {}},
+    }
+    old = _FakeContainer("web", attrs=attrs)
+    old.image.attrs["Config"] = {"Cmd": ["/whoami"], "Entrypoint": ["/whoami"]}  # == container: not overridden
+    client = _FakeClient(_FakeContainer("web", cid="newid"))
+    core._recreate_on_image(client, old, "alpine:latest", "web")
+    assert "command" not in client.api.created_kwargs       # let the new image supply its own
+    assert "entrypoint" not in client.api.created_kwargs
+
+
+def test_recreate_keeps_user_overridden_cmd():
+    attrs = {
+        "Config": {"Image": "app:1.0.0", "Cmd": ["--custom"], "Entrypoint": ["/app"]},
+        "HostConfig": {"NetworkMode": "default"}, "NetworkSettings": {"Networks": {}},
+    }
+    old = _FakeContainer("web", attrs=attrs)
+    old.image.attrs["Config"] = {"Cmd": ["/default"], "Entrypoint": ["/app"]}  # Cmd differs -> user override
+    client = _FakeClient(_FakeContainer("web", cid="newid"))
+    core._recreate_on_image(client, old, "app:1.1.0", "web")
+    assert client.api.created_kwargs["command"] == ["--custom"]  # override carried
+    assert "entrypoint" not in client.api.created_kwargs         # entrypoint matched image -> omitted
 
 
 def test_recreate_reattaches_user_network_with_aliases():

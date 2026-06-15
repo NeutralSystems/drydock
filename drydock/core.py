@@ -161,7 +161,10 @@ def safe_update(client, container, target_image: str, policy: ContainerPolicy) -
     """Pull target_image, recreate the container on it, health-check, ROLL BACK on any failure.
 
     Returns 'updated' | 'rolled_back' | 'error'. The original container is preserved (stopped +
-    renamed) until a healthy replacement exists, so no failure path can leave the user with nothing.
+    renamed) until a healthy replacement exists, so no failure path leaves the user with nothing.
+    'error' means *the rollback itself failed* (original needs manual recovery) or the pull failed
+    before anything was touched — a new image that won't pull/create/start/pass-health is a clean
+    'rolled_back', not an error.
     """
     name = container.name
     old = container
@@ -182,44 +185,55 @@ def safe_update(client, container, target_image: str, policy: ContainerPolicy) -
 
     _remove_if_exists(client, backup)        # clear any leftover backup from a prior crash
 
-    new = None
-    renamed = False
+    # 2. Stop + rename the original aside. It stays intact for an exact rollback.
     try:
-        # 2. Stop + rename the original aside. It stays intact for an exact rollback.
         old.stop()
         old.rename(backup)
-        renamed = True
-        # 3. Create + start the replacement on the new image, cloning the full config.
+    except docker.errors.APIError as e:
+        _log(name, target_image, f"error: could not stage update: {e}")
+        _try_restore(old, name)              # best-effort: leave it as we found it
+        return "error"
+
+    # 3. Bring up the replacement. ANY failure (create/start/health) -> roll back to the original.
+    new = None
+    fail_reason = None
+    try:
         new = _recreate_on_image(client, old, target_image, name)
-        # 4. Health-check.
-        if health_ok(new, policy):
-            _remove(old)                     # success: discard the old container
-            _log(name, target_image, "updated")
-            return "updated"
-        # 5. Unhealthy -> roll back: destroy the new one, restore the original exactly.
+        if not health_ok(new, policy):
+            fail_reason = "failed health check"
+    except Exception as e:  # noqa: BLE001
+        fail_reason = f"could not start: {e}"
+
+    if new is not None and fail_reason is None:
+        _remove(old)                         # success: discard the old container
+        _log(name, target_image, "updated")
+        return "updated"
+
+    # 4. Roll back: destroy the new one (if any) and restore the exact original.
+    print(f"[drydock] {name}: rolling back — {fail_reason}")
+    if new is not None:
         _remove(new)
-        new = None
-        old.rename(name)
-        renamed = False
-        old.start()
+    if _try_restore(old, name):
         _log(name, target_image, "rolled_back")
         return "rolled_back"
-    except Exception as e:  # noqa: BLE001 — last line of defense; the original MUST come back
-        if new is not None:
-            _remove(new)
-        if renamed:
-            try:
-                old.rename(name)
-            except docker.errors.APIError:
-                pass
-        try:
-            old.reload()
-            if old.status != "running":
-                old.start()
-        except docker.errors.APIError:
-            pass
-        _log(name, target_image, f"error: {e}")
-        return "error"
+    _log(name, target_image, "error: ROLLBACK FAILED — original needs manual recovery")
+    return "error"
+
+
+def _try_restore(old, name: str) -> bool:
+    """Rename the preserved original back to `name` and ensure it's running. True iff it ends up
+    running under the right name."""
+    try:
+        old.reload()
+        if (old.attrs.get("Name") or "").lstrip("/") != name:
+            old.rename(name)
+        old.reload()
+        if old.status != "running":
+            old.start()
+        old.reload()
+        return (old.attrs.get("Name") or "").lstrip("/") == name and old.status == "running"
+    except docker.errors.APIError:
+        return False
 
 
 def _recreate_on_image(client, old, target_image: str, name: str):
@@ -237,6 +251,18 @@ def _recreate_on_image(client, old, target_image: str, name: str):
     networks = (attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
     net_mode = host_config.get("NetworkMode", "default")
 
+    # Only carry Cmd/Entrypoint if the user OVERRODE the image default. The container's Config.Cmd/
+    # Entrypoint otherwise just echo the *old image's* baked-in values; forcing those onto a new
+    # image can break it (e.g. the new image lacks that binary) and pins a default the new version
+    # may have changed. If unchanged from the old image, omit them so the new image supplies its own.
+    img_cfg = (old.image.attrs.get("Config") or {})
+    command = config.get("Cmd")
+    if command == img_cfg.get("Cmd"):
+        command = None
+    entrypoint = config.get("Entrypoint")
+    if entrypoint == img_cfg.get("Entrypoint"):
+        entrypoint = None
+
     # User-defined networks (not the default bridge / host / none / container:). These carry
     # aliases + static IPs we must re-attach explicitly; the default bridge is handled by NetworkMode.
     user_nets = {}
@@ -251,8 +277,8 @@ def _recreate_on_image(client, old, target_image: str, name: str):
 
     create_kwargs = {
         "image": target_image,
-        "command": config.get("Cmd"),
-        "entrypoint": config.get("Entrypoint"),
+        "command": command,
+        "entrypoint": entrypoint,
         "environment": config.get("Env"),
         "labels": config.get("Labels") or {},
         "user": config.get("User") or "",
@@ -268,15 +294,24 @@ def _recreate_on_image(client, old, target_image: str, name: str):
     create_kwargs = {k: v for k, v in create_kwargs.items() if v is not None}
 
     new_id = api.create_container(**create_kwargs)["Id"]
-    # Attach any remaining user-defined networks (multi-network containers).
-    for n, ep in user_nets.items():
-        if n == primary:
-            continue
+    try:
+        # Attach any remaining user-defined networks (multi-network containers).
+        for n, ep in user_nets.items():
+            if n == primary:
+                continue
+            try:
+                api.connect_container_to_network(new_id, n, **_connect_opts(ep, old))
+            except docker.errors.APIError:
+                pass
+        api.start(new_id)
+    except Exception:
+        # Never leave a half-created container squatting the name — clean it up, then re-raise so
+        # safe_update rolls back to the original.
         try:
-            api.connect_container_to_network(new_id, n, **_connect_opts(ep, old))
+            api.remove_container(new_id, force=True)
         except docker.errors.APIError:
             pass
-    api.start(new_id)
+        raise
     return client.containers.get(new_id)
 
 
