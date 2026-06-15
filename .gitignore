@@ -8,6 +8,7 @@ dist/
 build/
 drydock-history.json
 .pytest_cache/
+.testenv/
 # demo recordings live as release assets / external embeds, not in the repo
 *.mp4
 *.mov
