@@ -69,6 +69,18 @@ services:
 - [ ] v0.2 — notifications (email/Discord/webhook), update history UI
 - [ ] later — multi-host fleet + hosted dashboard (the paid tier; the tool itself stays free & open)
 
+## Platform support
+
+Drydock talks to Docker through the Docker API (via the SDK), so it runs **anywhere Docker runs**:
+
+| OS | Docker | Status |
+|----|--------|--------|
+| **Linux** | native Docker Engine (no Docker Desktop needed) | ✅ supported — primary target |
+| **Windows** | Docker Desktop (WSL2) | ✅ supported — uses the named pipe automatically |
+| **macOS** | Docker Desktop | 🟡 should work (same Docker-API path) — *not yet verified, no Mac on hand* |
+
+If you're on macOS and it works (or doesn't), please open an issue — we want to confirm it.
+
 ## License
 
 AGPL-3.0 — open and auditable; if you run a modified version as a service, share your changes.
