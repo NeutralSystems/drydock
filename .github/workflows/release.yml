@@ -1,0 +1,43 @@
+name: release
+
+# When you publish a release / push a version tag (e.g. v0.1.0), this builds the Docker image and
+# pushes it to Docker Hub automatically — multi-arch (amd64 + arm64, so it runs on servers AND
+# Raspberry Pis). You never build locally. One-time setup: add two repo secrets under
+# Settings → Secrets and variables → Actions:
+#   DOCKERHUB_USERNAME  — your Docker Hub username
+#   DOCKERHUB_TOKEN     — a Docker Hub access token (Account Settings → Security → New Access Token)
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: neutralsystems/drydock
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
