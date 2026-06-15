@@ -72,6 +72,33 @@ services:
 | `drydock.healthcheck` | URL or `cmd:...` | how to verify health post-update (falls back to Docker HEALTHCHECK) |
 | `drydock.rollback_window` | seconds (default 60) | how long to watch before declaring success |
 
+## Scope & known limitations (v0.1)
+
+Drydock is deliberately small and honest about its edges:
+
+- **Standalone containers, not Compose/Swarm (yet).** If you point it at a container that
+  `docker compose` or Swarm manages, your orchestrator will later see drift and may revert or
+  recreate it. Use Drydock for plain `docker run` containers for now — Compose awareness is on the
+  roadmap.
+- **Healthcheck reachability.** An `http://` healthcheck is probed *from where Drydock runs*, so it
+  must be reachable from there (use the published host port). For checks that only make sense inside
+  the container, use the image's own Docker `HEALTHCHECK` or a `cmd:` healthcheck.
+- **Slow starters.** Bump `drydock.rollback_window` for apps that take a while to come up, or they'll
+  look unhealthy and roll back.
+- **Update detection** compares registry digests: public Docker Hub enforces anonymous pull-rate
+  limits, and private registries need `docker login` credentials. When Drydock can't read the
+  registry it skips quietly — it never reports a false update.
+- **Verified on Linux and Windows/Docker Desktop.** macOS uses the identical Docker-API path but
+  isn't verified yet — reports welcome.
+
+## Security
+
+- Drydock talks to the **Docker socket**, which is **root-equivalent** on the host — inherent to
+  anything that manages containers. Run it only where you'd run Docker admin tooling. (The future
+  hosted multi-host tier will use a scoped agent, not raw socket access.)
+- It only ever touches containers you explicitly opt in with `drydock.enable=true`.
+- AGPL-3.0, auditable, **no telemetry, no network calls** except to your image registry.
+
 ## Status / roadmap
 
 - [x] v0.1 — watch + detect updates + safety classification + **safe-apply with rollback** + approval mode
