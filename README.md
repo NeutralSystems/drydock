@@ -50,6 +50,10 @@ services:
       - drydock.healthcheck=http://localhost:8080/health
 ```
 
+> **Windows / Docker Desktop:** same thing — Drydock talks to Docker through the SDK, which uses the
+> Windows named pipe automatically. If running Drydock *as a container*, mount the socket with a leading
+> double-slash: `-v //var/run/docker.sock:/var/run/docker.sock`. See [TESTING.md](TESTING.md).
+
 ## Config (per-container labels)
 
 | Label | Values | Meaning |

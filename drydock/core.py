@@ -1,75 +1,84 @@
 """The engine: detect updates, then apply them SAFELY (health-check + auto-rollback).
 
-NOTE (v0.1 status): registry-check and the safe-update/rollback flow are implemented against the
-Docker SDK but still need hardening + live-Docker testing — especially full run-config preservation
-on container recreate (ports/volumes/networks/env/restart-policy). Marked with TODO(harden).
+v0.1 status: implemented against the Docker SDK; needs live-Docker testing (Linux + Windows/Docker
+Desktop). Run-config preservation on recreate covers the common cases (image/env/ports/volumes/
+restart/labels/network-mode); exotic options (caps, devices, extra mounts) are TODO(harden).
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import docker  # type: ignore
 
 from . import safety
 from .config import ContainerPolicy, policy_for
 
+HISTORY_PATH = Path(os.environ.get("DRYDOCK_HISTORY", "drydock-history.json"))
+
 
 @dataclass
 class Update:
     container_name: str
-    image: str
-    current_tag: str
-    new_tag: str
-    level: str          # major | minor | patch | unknown
+    image: str            # full ref, e.g. "myapp:1.2.3"
+    tag: str
+    level: str            # major | minor | patch | unknown
 
 
 def get_client():
+    # from_env() respects DOCKER_HOST and works with the Linux socket AND the
+    # Windows/Docker-Desktop named pipe (npipe:////./pipe/docker_engine) — cross-platform.
     return docker.from_env()
 
 
 def managed_containers(client):
     """Running containers that opted in via drydock.enable=true."""
-    for c in client.containers.list():
-        if policy_for(c.labels).enabled:
-            yield c
+    return [c for c in client.containers.list() if policy_for(c.labels).enabled]
+
+
+def _running_repo_digest(container) -> str | None:
+    """The manifest digest the running container's image was pulled at (RepoDigests)."""
+    digests = container.image.attrs.get("RepoDigests") or []
+    return digests[0].split("@", 1)[1] if digests and "@" in digests[0] else None
 
 
 def check_update(client, container) -> Update | None:
-    """Compare the container's running image digest to the registry's current digest."""
-    image_ref = container.attrs["Config"]["Image"]          # e.g. "myapp:1.2.3"
+    """Compare the running image's manifest digest to the registry's current digest.
+
+    (Fix vs first draft: compare manifest digest to manifest digest — NOT image.id, which is a
+    different sha and would always look 'changed'.)
+    """
+    image_ref = container.attrs["Config"]["Image"]
     tag = image_ref.split(":")[-1] if ":" in image_ref else "latest"
     try:
-        running_digest = container.image.id
-        remote = client.images.get_registry_data(image_ref)
-        remote_digest = remote.id
+        remote_digest = client.images.get_registry_data(image_ref).id
     except docker.errors.APIError:
-        return None                                          # registry unreachable -> skip quietly
-    if remote_digest == running_digest:
+        return None  # registry unreachable / private without creds -> skip quietly
+    if _running_repo_digest(container) == remote_digest:
         return None
-    # NOTE: same tag, new digest -> "unknown" level (e.g. :latest moved). Real semver compare
-    # happens when the container is pinned to a versioned tag and a newer tag is offered.
-    level = safety.classify(tag, tag) if tag not in ("latest", "") else "unknown"
-    return Update(container.name, image_ref, tag, tag, level)
+    level = "unknown" if tag in ("latest", "") else safety.classify(tag, tag)
+    return Update(container.name, image_ref, tag, level)
 
 
 def health_ok(container, policy: ContainerPolicy) -> bool:
-    """Verify the (re)started container is healthy within the rollback window."""
+    """Is the (re)started container healthy within the rollback window?"""
     deadline = time.time() + policy.rollback_window
     while time.time() < deadline:
         container.reload()
         if container.status != "running":
             return False
-        state = container.attrs.get("State", {})
-        health = state.get("Health", {}).get("Status")       # if image defines HEALTHCHECK
         if policy.healthcheck and policy.healthcheck.startswith("http"):
             if _http_ok(policy.healthcheck):
                 return True
-        elif health == "healthy":
-            return True
-        elif health is None and policy.healthcheck is None:
-            # no healthcheck defined anywhere -> treat "still running after window" as success
-            pass
+        else:
+            health = container.attrs.get("State", {}).get("Health", {}).get("Status")
+            if health == "healthy":
+                return True
+            if health is None:  # no HEALTHCHECK defined -> "still running after window" = success
+                pass
         time.sleep(3)
     container.reload()
     return container.status == "running"
@@ -83,32 +92,37 @@ def _http_ok(url: str) -> bool:
         return False
 
 
-def safe_update(client, container, update: Update, policy: ContainerPolicy) -> str:
-    """Pull new image, recreate the container, health-check, and ROLL BACK on failure.
+def safe_update(client, container, target_image: str, policy: ContainerPolicy) -> str:
+    """Pull target_image, recreate the container on it, health-check, ROLL BACK on failure.
 
-    Returns: 'updated' | 'rolled_back' | 'error'.
+    Returns 'updated' | 'rolled_back' | 'error'. target_image lets the daemon pass the detected
+    newer image, and lets `drydock apply --to` force a specific image (used for the rollback demo).
     """
-    previous_image = container.image.id                      # snapshot for rollback
-    run_config = _capture_run_config(container)              # TODO(harden): cover all run opts
+    name = container.name
+    previous_image = container.image.id  # local id is fine for *rollback* (re-run exact prior image)
+    run_config = _capture_run_config(container)
     try:
-        client.images.pull(update.image)
+        client.images.pull(target_image)
         container.stop()
         container.remove()
-        new = client.containers.run(update.image, **run_config)
+        run_config["image"] = target_image
+        new = client.containers.run(**run_config)
         if health_ok(new, policy):
+            _log(name, target_image, "updated")
             return "updated"
         # --- rollback ---
-        new.stop(); new.remove()
+        new.stop()
+        new.remove()
         run_config["image"] = previous_image
         client.containers.run(**run_config)
+        _log(name, target_image, "rolled_back")
         return "rolled_back"
-    except docker.errors.APIError:
+    except docker.errors.APIError as e:
+        _log(name, target_image, f"error: {e}")
         return "error"
 
 
 def _capture_run_config(container) -> dict:
-    """Capture enough of a container's config to recreate it. TODO(harden): networks, mounts,
-    restart policy, capabilities, etc. v0.1 covers the common cases."""
     attrs = container.attrs
     cfg = attrs["Config"]
     host = attrs["HostConfig"]
@@ -120,6 +134,7 @@ def _capture_run_config(container) -> dict:
         "ports": _ports(host.get("PortBindings")),
         "volumes": host.get("Binds") or [],
         "restart_policy": host.get("RestartPolicy") or None,
+        "network_mode": host.get("NetworkMode") or None,
         "labels": cfg.get("Labels") or {},
     }
 
@@ -130,3 +145,14 @@ def _ports(port_bindings) -> dict:
         if binds:
             out[cont_port] = binds[0].get("HostPort")
     return out
+
+
+def _log(container: str, image: str, result: str) -> None:
+    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "container": container, "image": image, "result": result}
+    try:
+        history = json.loads(HISTORY_PATH.read_text()) if HISTORY_PATH.exists() else []
+        history.append(entry)
+        HISTORY_PATH.write_text(json.dumps(history, indent=2))
+    except OSError:
+        pass
+    print(f"[drydock] {container}: {result} ({image})")
