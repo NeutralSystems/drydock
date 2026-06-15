@@ -24,12 +24,21 @@ owns the safe, reversible middle.** Drydock does.
 
 ## What makes it different
 
-- ✅ **Health-checked updates** — after updating, Drydock verifies the container is actually healthy.
+- 🛟 **Your original is never destroyed** — Drydock stops and renames the running container *aside*,
+  brings the new one up alongside it, and only deletes the old one **after** the new one passes its
+  health check. If anything fails — bad image, failed pull, daemon hiccup — it restarts the exact
+  original container. No update path can ever leave you with *nothing*.
+- ✅ **Health-checked updates** — after updating, Drydock verifies the container is actually healthy
+  (HTTP probe, in-container command, or the image's own Docker `HEALTHCHECK`).
 - ↩️ **Automatic rollback** — if the new version fails its health check, Drydock restores the previous
-  image automatically. You wake up to a *working* stack, not a broken one.
+  container automatically. You wake up to a *working* stack, not a broken one.
+- 🧬 **Faithful recreate** — env, ports, volumes, mounts, capabilities, devices, restart policy, log
+  config, user-defined networks (with their aliases), and the rest of the container's config are
+  carried over verbatim — not a hand-picked subset.
 - 🙋 **Approval mode (default)** — Drydock never auto-applies; it tells you what's available and you
   approve. Or switch to `auto-safe` to auto-apply patch/minor only.
-- 🚦 **Major-version guardrails** — semver-aware: major bumps are always flagged, never silent.
+- 🚦 **Major-version guardrails** — semver-aware: major bumps (and non-semver tags like `latest`) are
+  always flagged, never silent.
 - 🧾 **Update history** — what changed, when, and whether it rolled back.
 
 ## Quickstart *(planned)*
@@ -65,7 +74,8 @@ services:
 
 ## Status / roadmap
 
-- [ ] v0.1 — watch + detect updates + safety classification + **safe-apply with rollback** + approval mode
+- [x] v0.1 — watch + detect updates + safety classification + **safe-apply with rollback** + approval mode
+      *(engine done; safety contract covered by unit tests; rollback verified live on Windows/Docker Desktop)*
 - [ ] v0.2 — notifications (email/Discord/webhook), update history UI
 - [ ] later — multi-host fleet + hosted dashboard (the paid tier; the tool itself stays free & open)
 
@@ -80,6 +90,17 @@ Drydock talks to Docker through the Docker API (via the SDK), so it runs **anywh
 | **macOS** | Docker Desktop | 🟡 should work (same Docker-API path) — *not yet verified, no Mac on hand* |
 
 If you're on macOS and it works (or doesn't), please open an issue — we want to confirm it.
+
+## Develop
+
+```
+pip install -r requirements.txt pytest
+pytest            # pure-logic + safety-contract tests; no Docker daemon needed
+```
+
+The tests simulate the recreate/rollback flow with fake Docker objects and assert the core
+guarantee — *no failure path (unhealthy, failed create, failed pull) ever leaves you without your
+original container.* See [TESTING.md](TESTING.md) for the end-to-end live demo against a real daemon.
 
 ## License
 
