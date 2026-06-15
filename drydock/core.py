@@ -107,6 +107,7 @@ def health_ok(container, policy: ContainerPolicy) -> bool:
     """
     deadline = time.time() + policy.rollback_window
     hc = policy.healthcheck
+    explicit = bool(hc and (hc.startswith("http") or hc.startswith("cmd:")))
     while time.time() < deadline:
         try:
             container.reload()
@@ -118,11 +119,10 @@ def health_ok(container, policy: ContainerPolicy) -> bool:
         if status != "running":          # created / restarting -> keep waiting
             time.sleep(1)
             continue
-        if hc and hc.startswith("http"):
-            if _http_ok(hc):
+        if explicit:
+            if hc.startswith("http") and _http_ok(hc):
                 return True
-        elif hc and hc.startswith("cmd:"):
-            if _exec_ok(container, hc[len("cmd:"):]):
+            if hc.startswith("cmd:") and _exec_ok(container, hc[len("cmd:"):]):
                 return True
         else:
             health = (container.attrs.get("State", {}).get("Health") or {}).get("Status")
@@ -130,13 +130,21 @@ def health_ok(container, policy: ContainerPolicy) -> bool:
                 return True
             if health == "unhealthy":
                 return False
-            # health is None -> no HEALTHCHECK defined; "running past the window" is our signal
-        time.sleep(3)
+            # health is None -> no HEALTHCHECK defined; decided after the window
+        time.sleep(2)
+    # Window elapsed without a clear pass.
     try:
         container.reload()
     except docker.errors.NotFound:
         return False
-    return container.status == "running"
+    if container.status != "running":
+        return False
+    if explicit:
+        return False  # an explicit healthcheck was configured but never passed -> failed
+    health = (container.attrs.get("State", {}).get("Health") or {}).get("Status")
+    if health is not None:
+        return health == "healthy"  # image defines a HEALTHCHECK -> require it healthy
+    return True  # no healthcheck signal at all: still running past the window = success
 
 
 def _http_ok(url: str) -> bool:
@@ -171,11 +179,17 @@ def safe_update(client, container, target_image: str, policy: ContainerPolicy) -
     backup = f"{name}__drydock_bak"
 
     # 1. Pull FIRST — fully non-destructive. A bad ref / network error aborts before we touch anything.
+    #    If the pull fails but the exact image is already present locally (transient registry issue,
+    #    or a forced --to a locally-built image), proceed with the local copy instead of failing.
     try:
         client.images.pull(target_image)
     except docker.errors.APIError as e:
-        _log(name, target_image, f"error: pull failed: {e}")
-        return "error"
+        try:
+            client.images.get(target_image)
+            print(f"[drydock] {name}: pull failed ({e}); using local image {target_image}")
+        except docker.errors.ImageNotFound:
+            _log(name, target_image, f"error: pull failed and image not present locally: {e}")
+            return "error"
 
     try:
         old.reload()
@@ -275,6 +289,16 @@ def _recreate_on_image(client, old, target_image: str, name: str):
         primary = net_mode if net_mode in user_nets else next(iter(user_nets))
         networking_config = api.create_networking_config({primary: _endpoint(api, user_nets[primary], old)})
 
+    # Re-declare ExposedPorts. PortBindings (in host_config) are ignored by the daemon for ports the
+    # image doesn't EXPOSE, so a `-p` on an image with no EXPOSE would silently lose its mapping.
+    ports = []
+    for p in (config.get("ExposedPorts") or {}):
+        num, _, proto = str(p).partition("/")
+        try:
+            ports.append((int(num), proto or "tcp"))
+        except ValueError:
+            pass
+
     create_kwargs = {
         "image": target_image,
         "command": command,
@@ -286,6 +310,7 @@ def _recreate_on_image(client, old, target_image: str, name: str):
         "hostname": config.get("Hostname") or None,
         "stop_signal": config.get("StopSignal") or None,
         "healthcheck": config.get("Healthcheck") or None,
+        "ports": ports or None,
         "name": name,
         "detach": True,
         "host_config": host_config,

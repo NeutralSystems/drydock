@@ -167,6 +167,10 @@ class _FakeClient:
             def pull(_self, ref):
                 if fail_pull:
                     raise derr.APIError("pull failed")
+
+            def get(_self, ref):
+                # simulate: target image not present locally (so pull-failure -> error)
+                raise derr.ImageNotFound(f"no such image {ref}")
         self.images = _Images()
 
 
